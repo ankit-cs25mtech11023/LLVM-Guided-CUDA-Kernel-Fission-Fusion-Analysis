@@ -7,10 +7,17 @@
 #include "llvm/IR/IntrinsicInst.h" // Needed for Intrinsics
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Support/CommandLine.h"
 #include <map>
 #include <set>
 
 using namespace llvm;
+static cl::opt<unsigned> ThreadCount(
+    "thread-count",
+    cl::desc("Estimated total thread count for intermediate buffer size calculation"),
+    cl::value_desc("N"),
+    cl::init(1u << 20)); // default: 1M threads
 
 enum class InstCategory {
 	MEMORY_READ,
@@ -45,6 +52,22 @@ struct KernelPhase {
     bool ContainsLoop = false;
     int EstimatedLoopTripCount = 1; // default 1 means "no loop"
 };
+struct CutValue {
+    Value *Val;
+    unsigned SizeBytes;
+    bool IsPerThread;
+    unsigned RecomputeInstructions; // for pointer types: # instrs to recompute in next kernel
+};
+
+struct PhaseBoundary {
+    int FromPhase;
+    int ToPhase;
+    std::vector<CutValue> CutSet;
+    unsigned TotalIntermediateBytes;
+    unsigned TotalRecomputeInstructions; // sum of recompute chains for all pointer cut values
+    bool IsFeasible;
+};
+
 
 InstCategory classifyInstruction(Instruction *I) {
 	// 1. Memory Operations
@@ -137,6 +160,81 @@ PhaseType classifyBasicBlock(BasicBlock *BB,
     return PhaseType::MIXED;
 }
 
+static std::set<Value*> defsInPhase(const KernelPhase &P) {
+    std::set<Value*> Defs;
+    for (BasicBlock *BB : P.Blocks)
+        for (Instruction &I : *BB)
+            Defs.insert(&I);
+    return Defs;
+}
+
+static std::set<Value*> usesInPhase(const KernelPhase &P) {
+    std::set<Value*> Uses;
+    for (BasicBlock *BB : P.Blocks)
+        for (Instruction &I : *BB)
+            for (Use &U : I.operands())
+                if (isa<Instruction>(U.get()))
+                    Uses.insert(U.get());
+    return Uses;
+}
+
+// Count the number of unique instructions needed to recompute V in a fresh kernel.
+// Stops at Arguments (passed as kernel params) and Constants (compile-time literals).
+static unsigned countRecomputeChain(Value *V, std::set<Value*> &Visited) {
+    if (!V || !isa<Instruction>(V)) return 0; // Argument or Constant: free
+    if (Visited.count(V))           return 0; // already counted this node
+    Visited.insert(V);
+    unsigned cost = 1; // this instruction itself
+    for (Use &U : cast<Instruction>(V)->operands())
+        cost += countRecomputeChain(U.get(), Visited);
+    return cost;
+}
+
+
+static std::vector<PhaseBoundary> computeDependencies(
+        const std::vector<KernelPhase> &Phases,
+        const DataLayout &DL,
+        unsigned EstimatedThreads = 1u << 20) {
+
+    std::vector<PhaseBoundary> Boundaries;
+    const unsigned MaxFeasibleBytes = 256u * 1024 * 1024; // 256 MB threshold
+
+    for (int i = 0; i + 1 < (int)Phases.size(); i++) {
+        std::set<Value*> Defs = defsInPhase(Phases[i]);
+        std::set<Value*> Uses = usesInPhase(Phases[i + 1]);
+
+                PhaseBoundary B;
+        B.FromPhase = i;
+        B.ToPhase   = i + 1;
+        B.TotalIntermediateBytes     = 0;
+        B.TotalRecomputeInstructions = 0;
+
+        for (Value *V : Uses) {
+            if (!Defs.count(V)) continue;
+
+            Type    *Ty          = V->getType();
+            unsigned SzBytes     = (unsigned)DL.getTypeStoreSize(Ty);
+            bool     IsPerThread = !Ty->isPointerTy();
+
+            unsigned RecomputeCost = 0;
+            if (!IsPerThread) {
+                std::set<Value*> Visited;
+                RecomputeCost = countRecomputeChain(V, Visited);
+                B.TotalRecomputeInstructions += RecomputeCost;
+            }
+
+            B.CutSet.push_back({V, SzBytes, IsPerThread, RecomputeCost});
+            if (IsPerThread)
+                B.TotalIntermediateBytes += SzBytes * EstimatedThreads;
+        }
+
+        B.IsFeasible = (B.TotalIntermediateBytes < MaxFeasibleBytes);
+
+        Boundaries.push_back(B);
+    }
+    return Boundaries;
+}
+
 namespace {
 	// Inherit from ModulePass for legacy PM
 	
@@ -193,11 +291,12 @@ namespace {
 
 							std::set<Loop*> ProcessedLoops;
 
-							for (BasicBlock &BB : *F) {
+							ReversePostOrderTraversal<Function*> RPOT(F);
+							for (BasicBlock *BB : RPOT) {
 
 								// --- Case 1: This BB is inside a loop ---
-								if (BBToLoop.count(&BB)) {
-									Loop *L = BBToLoop[&BB];
+								if (BBToLoop.count(BB)) {
+									Loop *L = BBToLoop[BB];
 									if (ProcessedLoops.count(L)) continue; // already handled all BBs of this loop
 									ProcessedLoops.insert(L);
 
@@ -247,7 +346,7 @@ namespace {
 								// --- Case 2: Normal BB, not inside any loop ---
 								} else {
 									int reads = 0, writes = 0, cLight = 0, cHeavy = 0, syncs = 0;
-									for (Instruction &I : BB) {
+									for (Instruction &I : *BB) {
 										InstCategory Cat = classifyInstruction(&I);
 										if (Cat == InstCategory::MEMORY_READ)    reads++;
 										else if (Cat == InstCategory::MEMORY_WRITE)  writes++;
@@ -256,11 +355,11 @@ namespace {
 										else if (Cat == InstCategory::SYNC)          syncs++;
 									}
 
-									PhaseType BlockType = classifyBasicBlock(&BB, reads, writes, cLight, cHeavy, syncs);
+									PhaseType BlockType = classifyBasicBlock(BB, reads, writes, cLight, cHeavy, syncs);
 
 									if (BlockType == CurrentPhase.Type || CurrentPhase.Blocks.empty()) {
 										CurrentPhase.Type = BlockType;
-										CurrentPhase.Blocks.push_back(&BB);
+										CurrentPhase.Blocks.push_back(BB);
 										CurrentPhase.NumMemRead      += reads;
 										CurrentPhase.NumMemWrite     += writes;
 										CurrentPhase.NumComputeLight += cLight;
@@ -270,7 +369,7 @@ namespace {
 										CurrentPhase = KernelPhase();
 										CurrentPhase.PhaseID = Phases.size();
 										CurrentPhase.Type = BlockType;
-										CurrentPhase.Blocks.push_back(&BB);
+										CurrentPhase.Blocks.push_back(BB);
 										CurrentPhase.NumMemRead      += reads;
 										CurrentPhase.NumMemWrite     += writes;
 										CurrentPhase.NumComputeLight += cLight;
@@ -299,6 +398,30 @@ namespace {
 									<< ", Compute: " << (P.NumComputeLight + P.NumComputeHeavy) << "\n";
 								if (P.ContainsLoop)
 									errs() << "    Loop: yes (trip count = " << P.EstimatedLoopTripCount << ")\n";
+							}
+
+							// --- TASK 4: DEPENDENCY ANALYSIS ---
+							const DataLayout &DL = M.getDataLayout();
+							std::vector<PhaseBoundary> Boundaries = computeDependencies(Phases, DL, ThreadCount);
+
+							errs() << "\nDependency Analysis (" << Boundaries.size() << " boundaries):\n";
+							for (const auto &B : Boundaries) {
+								errs() << "  Cut " << B.FromPhase << " -> " << B.ToPhase
+									<< ": " << B.CutSet.size() << " crossing value(s)";
+								if (B.TotalIntermediateBytes > 0)
+									errs() << ", " << (B.TotalIntermediateBytes / 1024) << " KB buffer";
+								if (B.TotalRecomputeInstructions > 0)
+									errs() << ", " << B.TotalRecomputeInstructions << " instr recompute";
+								errs() << (B.IsFeasible ? "  [FEASIBLE]" : "  [INFEASIBLE]") << "\n";
+								for (const auto &CV : B.CutSet) {
+									errs() << "    ";
+									CV.Val->printAsOperand(errs(), false);
+									if (CV.IsPerThread)
+										errs() << "  (" << CV.SizeBytes << "B, per-thread -> buffer)\n";
+									else
+										errs() << "  (" << CV.SizeBytes << "B, pointer -> recompute "
+											<< CV.RecomputeInstructions << " instr)\n";
+								}
 							}
 
 
